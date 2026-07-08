@@ -3841,7 +3841,8 @@ window.Qube = new QubeSystem();
       wells: [],    // Particle emitter objects
       joints: [],  // Store created joints for debug draw
       particleSystem: null,
-      terrainSurface: []  // Unified exterior surface edges of all terrain blocks
+      terrainSurface: [],  // Unified exterior surface edges of all terrain blocks
+      terrainGravityParams: null  // { strength, radius } terrain-группы (max по блокам)
     };
     let debris = [];
 
@@ -3873,10 +3874,10 @@ window.Qube = new QubeSystem();
     // ═══════════════════════════════════════════════════════════════════════
     window.DreamPlugins = {
       // GitHub configuration
+      // ВНИМАНИЕ: токен НЕ хранится в коде (GitHub блокирует пуш файлов с
+      // секретами и сразу отзывает засвеченные токены). Задай его один раз
+      // в консоли:  localStorage.setItem('dream_gh_token', 'ghp_...')
       git: {
-        // ВНИМАНИЕ: токен НЕ хранится в коде (GitHub блокирует пуш файлов с
-        // секретами и сразу отзывает засвеченные токены). Задай его один раз
-        // в консоли:  localStorage.setItem('dream_gh_token', 'ghp_...')
         get token() { return localStorage.getItem('dream_gh_token') || ''; },
         owner: 'BuhJIR',
         repo: 'DREAM_LIGHT',
@@ -5722,6 +5723,10 @@ window.Qube = new QubeSystem();
           applyPointerGravity();
         }
         applyShapeGravity();
+        // Color-переходы частиц — ровно один раз на step, независимо от
+        // количества гравитационных источников (раньше вызывалось внутри
+        // applyShapeGravity: N источников = N× скорость, 0 источников = стоп)
+        stepParticleColorTransitions(FRAME_INTERVAL_SEC);
         applyThrusterForces();
 
         // Apply hero movement (simulate mode) - BEFORE physics step
@@ -5860,8 +5865,22 @@ window.Qube = new QubeSystem();
     const _tvec2 = { x: 0, y: 0 };  // temp vector 2
     const _tvec3 = { x: 0, y: 0 };  // temp vector 3
     const _closestResult = { point: { x: 0, y: 0 }, distance: 0 };
-    const _gravResult = { direction: { x: 0, y: 0 }, magnitude: 0 };
-    const MAX_GRAVITY_FORCE = 10;  // Clamp like original
+    const _gravResult = { direction: { x: 0, y: 0 }, magnitude: 0, accel: 0, distance: 0 };
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ЕДИНАЯ МОДЕЛЬ ГРАВИТАЦИИ К ПОВЕРХНОСТИ
+    // Одна формула для всех: блоки, герой, debris, lights, частицы.
+    // accel = strength × SURFACE_GRAVITY_ACCEL × falloff, F = accel × масса тела
+    // → все тела падают с одинаковым ускорением (как настоящая гравитация).
+    // Масса источника НЕ участвует — силой управляет только слайдер PWR.
+    // ═══════════════════════════════════════════════════════════════════════
+    const GRAVITY_DEPTH = 2;            // виртуальный центр под поверхностью — сглаживает пик силы у поверхности
+    const SURFACE_GRAVITY_ACCEL = 12;   // ускорение у поверхности при strength=1 (подогнано под старый дефолт)
+    const MAX_GRAVITY_FORCE = 120;      // клэмп ускорения — защита от взрыва при больших PWR
+    const HERO_GRAVITY_FACTOR = 0.85;   // герой на 15% легче — лучше управление (бывший HERO_GRAVITY_SCALE)
+    // falloff у поверхности = 1, дальше линейно спадает
+    const surfaceGravityFalloff = (distance) =>
+      (GRAVITY_DEPTH + 1) / (distance + GRAVITY_DEPTH + 1);
 
     // Vector math helpers (mutating versions for speed)
     const vecSubTo = (out, a, b) => { out.x = a.x - b.x; out.y = a.y - b.y; return out; };
@@ -5936,26 +5955,33 @@ window.Qube = new QubeSystem();
       return { point: closestPoint, distance: closestDist };
     }
 
-    // Calculate gravity force towards terrain surface
     // ═══════════════════════════════════════════════════════════════════════
-    // BEGIN: calculateTerrainGravity
-    // Направление и сила к ближайшей точке поверхности terrain.
-    // Источник поверхности: state.terrainSurface (единый контур всех terrain блоков).
-    // Fallback на per-block вершины если terrainSurface пуст.
-    // Дублирование силы при N terrain блоках предотвращается флагом
+    // BEGIN: calculateSurfaceGravity
+    // ЕДИНСТВЕННЫЙ источник правды для гравитации к поверхности.
+    // Направление и ускорение к ближайшей точке поверхности источника:
+    //   — terrain-блоки: state.terrainSurface (единый контур всей terrain-группы),
+    //     параметры — state.terrainGravityParams (порядко-независимые);
+    //   — обычный gravity-блок: его собственный полигон (per-block контур).
+    // Возвращает { direction, accel, distance } в shared _gravResult.
+    // accel — ускорение (сила на единицу массы): все тела падают одинаково.
+    // Дублирование при N terrain блоках предотвращается флагом
     // terrainGravityDone в applyShapeGravity.
     // ═══════════════════════════════════════════════════════════════════════
-    function calculateTerrainGravity(targetPos, targetMass, sourceBlock) {
-      if (!sourceBlock.body || !sourceBlock.vertices) return null;
+    function calculateSurfaceGravity(targetPos, sourceBlock) {
+      if (!sourceBlock.body || !(sourceBlock.vertices || sourceBlock.multiVerts)) return null;
 
-      // Используем state.terrainSurface — единый внешний контур всех terrain блоков.
-      // Это правильно: сила направлена к ближайшей точке поверхности всей структуры.
-      // Дублирование силы предотвращается флагом terrainGravityDone в applyShapeGravity.
-      let point, distance;
-      if (state.terrainSurface && state.terrainSurface.length > 0) {
+      let point, distance, strength, radius;
+      const useUnified = sourceBlock.isTerrain && state.terrainSurface && state.terrainSurface.length > 0;
+      if (useUnified) {
+        // Единый внешний контур всей terrain-группы
         const result = getClosestPointOnTerrainSurface(targetPos);
         point = result.point; distance = result.distance;
+        // Параметры группы (max по блокам) — не зависят от порядка итерации Set
+        const tg = state.terrainGravityParams;
+        strength = tg?.strength ?? sourceBlock.gravity?.strength ?? gravityStrength;
+        radius = tg?.radius ?? sourceBlock.gravity?.radius ?? gravityRadius;
       } else {
+        // Поверхность собственного полигона блока
         const pos = sourceBlock.body.GetPosition();
         const angle = sourceBlock.body.GetAngle();
         const bodyPos = { x: pos.get_x(), y: pos.get_y() };
@@ -5967,62 +5993,62 @@ window.Qube = new QubeSystem();
           : baseVerts.map(v => ({ x: v.x * scale, y: v.y * scale }));
         const r = getClosestPointOnPolygon(targetPos, scaledData, bodyPos, angle, isMulti);
         point = r.point; distance = r.distance;
+        strength = sourceBlock.gravity?.strength ?? gravityStrength;
+        radius = sourceBlock.gravity?.radius ?? gravityRadius;
       }
+
       // Need valid point and minimum distance to compute direction
       if (!point || distance < 0.05) return null;
-
-      // Use terrain gravity params
-      const radius = sourceBlock.gravity?.radius ?? gravityRadius;
-      const strength = sourceBlock.gravity?.strength ?? gravityStrength;
-
       if (distance > radius) return null;
 
       // Direction towards closest point on surface (use pre-allocated vectors)
       vecSubTo(_tvec1, point, targetPos);
       vecNormalizeTo(_tvec2, _tvec1);
 
-      // GRAVITY_DEPTH: virtual gravity center is under the surface
-      // This creates smooth gradient - no crazy force spike at surface!
-      const GRAVITY_DEPTH = 2;
-      const effectiveDist = distance + GRAVITY_DEPTH;
-      // Gravity formula: strength / (effectiveDist + 1) — linear falloff
-      const rawMagnitude = strength / (effectiveDist + 1);
-      const magnitude = Math.min(rawMagnitude, MAX_GRAVITY_FORCE);
+      const accel = Math.min(
+        strength * SURFACE_GRAVITY_ACCEL * surfaceGravityFalloff(distance),
+        MAX_GRAVITY_FORCE
+      );
 
       // Return using pre-allocated result object
       _gravResult.direction.x = _tvec2.x;
       _gravResult.direction.y = _tvec2.y;
-      _gravResult.magnitude = magnitude;
-      _gravResult.distance = distance;  // Include distance for hero gravity
+      _gravResult.accel = accel;
+      _gravResult.magnitude = accel;  // legacy alias
+      _gravResult.distance = distance;
       return _gravResult;
     }
-    // END: calculateTerrainGravity
+    // END: calculateSurfaceGravity
 
     // ═══════════════════════════════════════════════════════════════════════
     // BEGIN: applyShapeGravity
     // Применяет гравитацию от всех источников (shapeGravityBodies) к телам,
     // герою, debris, lights и частицам.
     //
-    // АРХИТЕКТУРА terrain-гравитации:
-    //   — Все terrain блоки (одиночные T1..Tn, combined C) остаются в
-    //     shapeGravityBodies как отдельные физические тела.
-    //   — Сила к поверхности считается ОДИН РАЗ через state.terrainSurface
-    //     (единый внешний контур всей terrain-структуры).
-    //   — Флаг terrainGravityDone: первый terrain в forEach обрабатывает всё,
-    //     остальные terrain пропускаются — нет дублирования N×сила.
-    //   — Point gravity блоки (не terrain) работают независимо через forEach.
+    // ОДНА гравитация — к поверхности. Point gravity удалена:
+    //   — terrain-блоки: сила к state.terrainSurface (единый контур группы),
+    //     считается ОДИН РАЗ на step (флаг terrainGravityDone);
+    //   — обычный gravity-блок: сила к поверхности его собственного полигона.
+    // Формула одна для всех целей (calculateSurfaceGravity):
+    //   F = accel × масса тела → одинаковое ускорение у всех тел.
+    // Флаги AFFECTS (BLCK/LGHT/LQID/PLYR) из вкладки GRAVITY теперь работают.
     // ═══════════════════════════════════════════════════════════════════════
-    // Shape Gravity - blocks with attached gravity attract other objects
-    // Uses gravityStrength and gravityRadius from COSMOS/GRAVITY tab for seamless editing
     function applyShapeGravity() {
       if (shapeGravityBodies.size === 0) return;
 
-      const t = _tempGravity;
+      // AFFECTS-флаги из UI (вкладка GRAVITY → ANCHOR)
+      const gp = window.tpPanes?.gravityParams;
+      const affectsBlocks = gp ? gp.affectsBlocks !== false : true;
+      const affectsPlayer = gp ? gp.affectsPlayer !== false : true;
+      const affectsLiquid = gp ? gp.affectsLiquid !== false : true;
+      const affectsLights = gp ? gp.affectsLights !== false : true;
 
       // Флаг: terrain-гравитация применяется ровно один раз на step.
       // При нескольких terrain блоках (T1, T2, combined C) — первый обрабатывает всё
       // через state.terrainSurface, остальные terrain пропускаются.
       let terrainGravityDone = false;
+
+      const _target = { x: 0, y: 0 };
 
       // For each gravity source
       shapeGravityBodies.forEach(sourceBlock => {
@@ -6037,121 +6063,40 @@ window.Qube = new QubeSystem();
           terrainGravityDone = true;
         }
 
-        const sourcePos = sourceBlock.body.GetPosition();
-        const sx = sourcePos.get_x();
-        const sy = sourcePos.get_y();
-
-        // Use per-block gravity if set, otherwise global
-        const g = sourceBlock.gravity || {
-          radius: gravityRadius,
-          strength: gravityStrength,
-          minDist: gravityMinDist
-        };
-
-        // Strength is size-independent
-        const effectStrength = g.strength;
-
-        // Helper: apply gravity to a body (terrain or point-based)
-        // BLOCK_GRAVITY_SCALE: tune overall gravity strength
-        const BLOCK_GRAVITY_SCALE = 5;  // Strong pull for solid blocks
-
-        const applyGravityToBody = (body, multiplier = 1) => {
+        // Единая формула: F = accel × масса тела (ускорение одинаково для всех тел)
+        const applyGravityToBody = (body, factor = 1) => {
           const pos = body.GetPosition();
-          const targetPos = { x: pos.get_x(), y: pos.get_y() };
-          // Use real mass for Newtonian gravity - all bodies fall equally!
-          // (F = M×m, acceleration = F/m = M - same for all!)
+          _target.x = pos.get_x();
+          _target.y = pos.get_y();
+          const grav = calculateSurfaceGravity(_target, sourceBlock);
+          if (!grav) return;
           const bodyMass = body.GetMass() || 1;
-
-          // TERRAIN: gravity to closest point on surface
-          if (sourceBlock.isTerrain && sourceBlock.vertices) {
-            const grav = calculateTerrainGravity(targetPos, 1, sourceBlock);
-            if (grav) {
-              // Use sqrt(sourceMass) for balanced terrain gravity
-              // Big terrains pull less than linear, small terrains stay ~same
-              const terrainMass = sourceBlock.savedMass || sourceBlock.body?.GetMass() || 100;
-              const balancedMass = Math.sqrt(terrainMass);  // sqrt for balance
-              // F = sqrt(terrainMass) × bodyMass × scale / r²
-              const GRAVITY_DEPTH = 2;
-              const effectiveDist = grav.distance + GRAVITY_DEPTH;
-              const force = balancedMass * bodyMass * BLOCK_GRAVITY_SCALE / (effectiveDist * effectiveDist + 1);
-              body.ApplyForceToCenter(getVec2(grav.direction.x * force, grav.direction.y * force), true);
-            }
-          } else {
-            // Point gravity (original behavior)
-            t.dx = sx - targetPos.x;
-            t.dy = sy - targetPos.y;
-            t.dist = Math.sqrt(t.dx * t.dx + t.dy * t.dy);
-
-            if (t.dist < g.radius && t.dist > (g.minDist || 0.5)) {
-              // Newtonian: F = M × m × scale / r²
-              t.strength = effectStrength * bodyMass * BLOCK_GRAVITY_SCALE / (t.dist * t.dist + 0.1) * multiplier;
-              t.nx = t.dx / t.dist;
-              t.ny = t.dy / t.dist;
-              body.ApplyForceToCenter(getVec2(t.nx * t.strength, t.ny * t.strength), true);
-            }
-          }
+          const force = grav.accel * bodyMass * factor;
+          body.ApplyForceToCenter(getVec2(grav.direction.x * force, grav.direction.y * force), true);
         };
 
         // Attract blocks
-        for (let i = 0; i < state.blocks.length; i++) {
-          const block = state.blocks[i];
-          if (!block.body || block === sourceBlock) continue;
-          if (shapeGravityBodies.has(block)) continue;  // Don't affect other gravity sources
-          applyGravityToBody(block.body);
+        if (affectsBlocks) {
+          for (let i = 0; i < state.blocks.length; i++) {
+            const block = state.blocks[i];
+            if (!block.body || block === sourceBlock) continue;
+            if (shapeGravityBodies.has(block)) continue;  // Don't affect other gravity sources
+            applyGravityToBody(block.body);
+          }
         }
 
-        // Attract hero in simulate mode (mass-based gravity)
-        if (simulateMode && heroBody) {
-          const hpos = heroBody.GetPosition();
-          const hx = hpos.get_x();
-          const hy = hpos.get_y();
-
-          // Get source mass - use sqrt for balanced gravity (big terrains pull less than linear).
-          let rawSourceMass;
-          if (sourceBlock.multiVerts) {
-            const sz = sourceBlock.size || (BLOCK_SIZE * 5);
-            rawSourceMass = 2 * sz * sz;
-          } else {
-            rawSourceMass = sourceBlock.savedMass || sourceBlock.body.GetMass() || sourceBlock.size;
-          }
-          const sourceMass = Math.sqrt(rawSourceMass);  // sqrt for balance
-
-          // HERO_GRAVITY_SCALE: -15% от блоков для лучшего управления
-          const HERO_GRAVITY_SCALE = 4.25;
-
-          if (sourceBlock.isTerrain && sourceBlock.vertices) {
-            // Terrain gravity for hero - LINEAR falloff like calculateTerrainGravity
-            const grav = calculateTerrainGravity({ x: hx, y: hy }, 1, sourceBlock);
-            if (grav) {
-              const GRAVITY_DEPTH = 2;
-              const effectiveDist = grav.distance + GRAVITY_DEPTH;
-              const heroMass = heroBody.GetMass() || 1;
-              // LINEAR: F = sqrt(M) × m × scale / (dist + 1)
-              const terrainForce = sourceMass * heroMass * HERO_GRAVITY_SCALE / (effectiveDist + 1);
-              heroBody.ApplyForceToCenter(getVec2(grav.direction.x * terrainForce, grav.direction.y * terrainForce), true);
-            }
-          } else {
-            // Point gravity - LINEAR falloff
-            t.dx = sx - hx;
-            t.dy = sy - hy;
-            t.dist = Math.sqrt(t.dx * t.dx + t.dy * t.dy);
-
-            if (t.dist < g.radius && t.dist > (g.minDist || 0.5)) {
-              const heroMass = heroBody.GetMass() || 1;
-              // LINEAR: F = sqrt(M) × m × scale / (dist + 1)
-              t.strength = sourceMass * heroMass * HERO_GRAVITY_SCALE / (t.dist + 1);
-              t.nx = t.dx / t.dist;
-              t.ny = t.dy / t.dist;
-              heroBody.ApplyForceToCenter(getVec2(t.nx * t.strength, t.ny * t.strength), true);
-            }
-          }
+        // Attract hero in simulate mode (чуть слабее — лучше управление)
+        if (affectsPlayer && simulateMode && heroBody) {
+          applyGravityToBody(heroBody, HERO_GRAVITY_FACTOR);
         }
 
         // Attract lights
-        for (let i = 0; i < state.lights.length; i++) {
-          const light = state.lights[i];
-          if (!light.body) continue;
-          applyGravityToBody(light.body);
+        if (affectsLights) {
+          for (let i = 0; i < state.lights.length; i++) {
+            const light = state.lights[i];
+            if (!light.body) continue;
+            applyGravityToBody(light.body);
+          }
         }
 
         // Attract debris (sliced block pieces)
@@ -6161,9 +6106,10 @@ window.Qube = new QubeSystem();
           applyGravityToBody(d.body);
         }
 
-        // Attract particles (liquid/steam/sand etc) - both systems
-        applyGravityToParticleSystem(state.particleSystemA, 'A');
-        stepParticleColorTransitions(FRAME_INTERVAL_SEC);
+        // Attract particles (liquid/steam/sand etc)
+        if (affectsLiquid) {
+          applyGravityToParticleSystem(state.particleSystemA, 'A');
+        }
 
         function applyGravityToParticleSystem(particleSys, systemId) {
           if (!particleSys) return;
@@ -6186,9 +6132,12 @@ window.Qube = new QubeSystem();
 
           for (let i = 0; i < count; i++) {
             const posOffset = (pos_p >> 2) + i * 2;
-            const px = HEAPF32[posOffset];
-            const py = HEAPF32[posOffset + 1];
+            _target.x = HEAPF32[posOffset];
+            _target.y = HEAPF32[posOffset + 1];
             const velOffset = (vel_p >> 2) + i * 2;
+
+            const grav = calculateSurfaceGravity(_target, sourceBlock);
+            if (!grav) continue;
 
             // Get particle weight from groups
             let particleWeight = 1;
@@ -6200,30 +6149,10 @@ window.Qube = new QubeSystem();
               }
             }
 
-            // TERRAIN gravity
-            if (sourceBlock.isTerrain && sourceBlock.vertices) {
-              const grav = calculateTerrainGravity({ x: px, y: py }, 1, sourceBlock);
-              if (grav && grav.distance < g.radius) {
-                const strength = PARTICLE_GRAVITY * effectStrength * particleWeight;
-                const clampedStr = Math.min(Math.abs(strength), 0.5) * Math.sign(strength);
-                HEAPF32[velOffset] += grav.direction.x * clampedStr;
-                HEAPF32[velOffset + 1] += grav.direction.y * clampedStr;
-              }
-            } else {
-              // Point gravity
-              t.dx = sx - px;
-              t.dy = sy - py;
-              t.dist = Math.sqrt(t.dx * t.dx + t.dy * t.dy);
-
-              if (t.dist < g.radius && t.dist > (g.minDist || 0.3)) {
-                const strength = PARTICLE_GRAVITY * effectStrength * particleWeight / (t.dist + 0.5);
-                const clampedStr = Math.min(Math.abs(strength), 0.5) * Math.sign(strength);
-                t.nx = t.dx / t.dist;
-                t.ny = t.dy / t.dist;
-                HEAPF32[velOffset] += t.nx * clampedStr;
-                HEAPF32[velOffset + 1] += t.ny * clampedStr;
-              }
-            }
+            // Та же формула, что и для тел, с частицным масштабом и клэмпом
+            const strength = Math.min(PARTICLE_GRAVITY * grav.accel * particleWeight, 0.5);
+            HEAPF32[velOffset] += grav.direction.x * strength;
+            HEAPF32[velOffset + 1] += grav.direction.y * strength;
           }
         }
       });
@@ -7498,24 +7427,19 @@ window.Qube = new QubeSystem();
         totalDy += pointer.y - hy;
       }
 
-      // Check shape gravity sources
+      // Check shape gravity sources — единая гравитация к поверхности.
+      // Вклад каждого источника взвешен его ускорением: доминирует ближний/сильный.
+      let terrainDone = false;
       shapeGravityBodies.forEach(sourceBlock => {
         if (!sourceBlock.body) return;
-        if (sourceBlock.isTerrain && (sourceBlock.vertices || sourceBlock.multiVerts)) {
-          const grav = calculateTerrainGravity({ x: hx, y: hy }, 1, sourceBlock);
-          if (grav) {
-            totalDx += grav.direction.x;
-            totalDy += grav.direction.y;
-          }
-        } else {
-          const sourcePos = sourceBlock.body.GetPosition();
-          const dx = sourcePos.get_x() - hx;
-          const dy = sourcePos.get_y() - hy;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist > 0.1 && dist < gravityRadius) {
-            totalDx += dx / dist;
-            totalDy += dy / dist;
-          }
+        if (sourceBlock.isTerrain) {
+          if (terrainDone) return;  // terrain-группа считается один раз
+          terrainDone = true;
+        }
+        const grav = calculateSurfaceGravity({ x: hx, y: hy }, sourceBlock);
+        if (grav) {
+          totalDx += grav.direction.x * grav.accel;
+          totalDy += grav.direction.y * grav.accel;
         }
       });
 
@@ -7648,30 +7572,20 @@ window.Qube = new QubeSystem();
       // For terrain: use direction to surface, not center!
       if (shapeGravityBodies.size > 0) {
         let closestDist = Infinity;
+        let terrainDone = false;
         shapeGravityBodies.forEach(sourceBlock => {
           if (!sourceBlock.body) return;
-
-          // For terrain: get direction to closest point on SURFACE
-          if (sourceBlock.isTerrain && (sourceBlock.vertices || sourceBlock.multiVerts)) {
-            const grav = calculateTerrainGravity({ x: hx, y: hy }, 1, sourceBlock);
-            if (grav && grav.distance < closestDist && grav.distance < gravityRadius * 2) {
-              closestDist = grav.distance;
-              gravityDirX = grav.direction.x;
-              gravityDirY = grav.direction.y;
-              hasGravitySource = true;
-            }
-          } else {
-            // For point gravity: direction to center
-            const sourcePos = sourceBlock.body.GetPosition();
-            const dx = sourcePos.get_x() - hx;
-            const dy = sourcePos.get_y() - hy;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist < closestDist && dist < gravityRadius * 2) {
-              closestDist = dist;
-              gravityDirX = dx;
-              gravityDirY = dy;
-              hasGravitySource = true;
-            }
+          if (sourceBlock.isTerrain) {
+            if (terrainDone) return;  // terrain-группа считается один раз
+            terrainDone = true;
+          }
+          // Единая гравитация: направление к ближайшей точке ПОВЕРХНОСТИ
+          const grav = calculateSurfaceGravity({ x: hx, y: hy }, sourceBlock);
+          if (grav && grav.distance < closestDist) {
+            closestDist = grav.distance;
+            gravityDirX = grav.direction.x;
+            gravityDirY = grav.direction.y;
+            hasGravitySource = true;
           }
         });
       }
@@ -9520,9 +9434,15 @@ window.Qube = new QubeSystem();
 
       // Собрать рёбра только terrain-блоков С гравитацией —
       // блоки без гравитации не участвуют в притяжении.
+      // Заодно считаем параметры гравитации группы (max по блокам) —
+      // раньше брались параметры «первого» блока из Set (порядок = лотерея).
       const allSegs = [];
+      let groupStrength = 0, groupRadius = 0, hasParams = false;
       for (const block of state.blocks) {
         if (!block.body || !block.isTerrain || !block.hasShapeGravity) continue;
+        groupStrength = Math.max(groupStrength, block.gravity?.strength ?? gravityStrength);
+        groupRadius = Math.max(groupRadius, block.gravity?.radius ?? gravityRadius);
+        hasParams = true;
         const wv = _blockWorldVerts(block);
         if (!wv) continue;
         const loops = Array.isArray(wv[0]) ? wv : [wv];
@@ -9533,6 +9453,9 @@ window.Qube = new QubeSystem();
           }
         }
       }
+      state.terrainGravityParams = hasParams
+        ? { strength: groupStrength, radius: groupRadius }
+        : null;
 
       if (!allSegs.length) { state.terrainSurface = []; return; }
 
@@ -10859,7 +10782,8 @@ window.Qube = new QubeSystem();
             clickedBlock.gravity = {
               strength: gp?.attachedForce?.x ?? gravityStrength,
               radius: gp?.attachedForce?.y ?? gravityRadius,
-              minDist: gp?.attachedForce?.z ?? gravityMinDist
+              minDist: gp?.attachedForce?.z ?? gravityMinDist,
+              isTerrain: !!clickedBlock.isTerrain
             };
             clickedBlock.body.SetType(Physics.b2_kinematicBody);
             clickedBlock.body.SetLinearVelocity(getVec2(0, 0));
@@ -11098,14 +11022,26 @@ window.Qube = new QubeSystem();
       const shouldHaveGravity = nextBlockGravity;
       if (newBlock && newBlock.body && shouldHaveGravity) {
         newBlock.hasShapeGravity = true;
+        // Параметры из ANCHOR-секции — как при attach кликом (раньше этот путь
+        // брал настройки POINTER-гравитации: два пути давали разные параметры)
+        const gp = window.tpPanes?.gravityParams;
         newBlock.gravity = {
           enabled: true,
-          strength: gravityStrength,
-          radius: gravityRadius,
+          strength: gp?.attachedForce?.x ?? gravityStrength,
+          radius: gp?.attachedForce?.y ?? gravityRadius,
+          minDist: gp?.attachedForce?.z ?? gravityMinDist,
           mode: 0,
           isTerrain: !!terrainMode
         };
-        if (!terrainMode) newBlock.savedMass = newBlock.body.GetMass();
+        if (!terrainMode) {
+          // Источник гравитации фиксирован в пространстве — как при attach
+          // кликом и при загрузке мира (раньше блок оставался dynamic до
+          // первого сохранения/загрузки)
+          newBlock.savedMass = newBlock.body.GetMass();
+          newBlock.body.SetType(Physics.b2_kinematicBody);
+          newBlock.body.SetLinearVelocity(getVec2(0, 0));
+          newBlock.body.SetAngularVelocity(0);
+        }
         shapeGravityBodies.add(newBlock);
       }
       // ─── END: terrain kinematic + gravity assignment ─────────────────────
@@ -12627,10 +12563,11 @@ window.Qube = new QubeSystem();
         anchorRadius: gravityRadius,
         anchorMinDist: gravityMinDist,
         mode: gravityMode,
-        // AFFECTS flags
+        // AFFECTS flags — теперь реально применяются в applyShapeGravity.
+        // Дефолты = прежнее фактическое поведение (всё включено).
         affectsBlocks: true,
-        affectsLights: gravityAffectLights,
-        affectsLiquid: false,
+        affectsLights: true,
+        affectsLiquid: true,
         affectsPlayer: true
       };
       tpPanes.gravityParams = gravityParams;
