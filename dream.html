@@ -4720,87 +4720,6 @@ window.Qube = new QubeSystem();
     }
 
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // DEBUG SNAPSHOT — overlap analysis
-    // ═══════════════════════════════════════════════════════════════════════
-    const _overlapDebug = {
-      snap1: null,  // первый снапшот (статичный блок)
-      snap2: null,  // второй снапшот (момент клика)
-      active: false // режим ожидания второго снапшота
-    };
-
-    function _takeOverlapSnapshot(label, worldX, worldY) {
-      const blocks = state.blocks.map(b => {
-        if (!b.body) return null;
-        const pos = b.body.GetPosition();
-        return {
-          id: b.uid ?? null,
-          shape: b.shape,
-          shapeId: b.shapeId,
-          size: b.size,
-          isTerrain: b.isTerrain ?? false,
-          pos: { x: pos.get_x(), y: pos.get_y() },
-          angle: b.body.GetAngle(),
-          vertices: b.vertices ?? null,
-          worldVerts: _blockWorldVerts(b)
-        };
-      }).filter(Boolean);
-
-      const sizeMultiplier = window.terrainMode ? 5 : 1;
-      const placementSize  = BLOCK_SIZE * sizeMultiplier;
-      const placementVerts = worldX != null
-        ? _placementVerts(worldX, worldY, placementSize, currentShapeId)
-        : null;
-
-      return {
-        label,
-        timestamp: Date.now(),
-        cursor: worldX != null ? { x: worldX, y: worldY } : null,
-        placementSize,
-        shapeId: currentShapeId,
-        placementVerts,
-        blocks,
-        scaledTileSize,
-        zoom,
-        panX, panY
-      };
-    }
-
-    function _downloadOverlapDebug() {
-      const data = {
-        snap1: _overlapDebug.snap1,
-        snap2: _overlapDebug.snap2,
-        note: 'snap1 = static scene, snap2 = at click moment'
-      };
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'overlap_debug_' + Date.now() + '.json';
-      a.click();
-      URL.revokeObjectURL(a.href);
-      console.log('[OverlapDebug] Downloaded. Resetting.');
-      _overlapDebug.snap1 = null;
-      _overlapDebug.snap2 = null;
-      _overlapDebug.active = false;
-    }
-
-    // Триггер: Shift+D
-    // Первое нажатие → snap1 (сцена без cursor)
-    // Второй снапшот берётся автоматически при следующем клике на canvas (wall tool)
-    function triggerOverlapDebug() {
-      if (!_overlapDebug.active) {
-        _overlapDebug.snap1 = _takeOverlapSnapshot('before_placement', null, null);
-        _overlapDebug.active = true;
-        console.log('[OverlapDebug] Snap1 taken. Now click to place — snap2 will fire automatically.');
-      } else {
-        // Повторное Shift+D сбрасывает
-        _overlapDebug.snap1 = null;
-        _overlapDebug.snap2 = null;
-        _overlapDebug.active = false;
-        console.log('[OverlapDebug] Reset.');
-      }
-    }
-
     function addBlock(x, y, options = {}) {
       if (!state.world || !Physics.ready) return null;
 
@@ -5061,7 +4980,8 @@ window.Qube = new QubeSystem();
           angularVelocity: data.angularVelocity,
           gravity: data.gravity ?? null,  // Per-block gravity
           isTerrain: data.isTerrain ?? false,  // Terrain flag
-          multiVerts: data.multiVerts,     // Restore multi-fixture structure
+          multiVerts: data.multiVerts,        // Restore multi-fixture structure
+          surfaceVerts: data.surfaceVerts,    // Restore combine surface contour
           fromSave: true  // Skip overlap check when loading
         }
       );
@@ -8485,6 +8405,16 @@ window.Qube = new QubeSystem();
             data.triangles = catalogShape.triangles;
           }
         }
+        // COMBINE: сохранить мульти-фикстурную геометрию и контур поверхности.
+        // Без этого при загрузке/навигации по истории combine пересобирался как
+        // ОДИН полигон из первого куска (options.multiVerts был undefined) —
+        // терялась геометрия и, как следствие, гравитация к поверхности.
+        if (block.multiVerts && Array.isArray(block.multiVerts)) {
+          data.multiVerts = block.multiVerts;
+        }
+        if (block.surfaceVerts) {
+          data.surfaceVerts = block.surfaceVerts;
+        }
         // Per-block gravity properties
         if (block.gravity) {
           data.gravity = block.gravity;
@@ -9308,25 +9238,8 @@ window.Qube = new QubeSystem();
 
 
     // ═══════════════════════════════════════════════════════════════════════
-    // CONSOLE INTERCEPTOR
+    // TOAST NOTIFICATION — крупное экранное уведомление (используется contour-tool)
     // ═══════════════════════════════════════════════════════════════════════
-    const _origConsole = { log: console.log, warn: console.warn, error: console.error };
-    const _consoleLog = [];
-    ['log','warn','error'].forEach(method => {
-      console[method] = (...args) => {
-        _origConsole[method](...args);
-        _consoleLog.push({ method, ts: Date.now(), msg: args.map(a => {
-          try { return typeof a === 'object' ? JSON.stringify(a) : String(a); } catch(e) { return String(a); }
-        }).join(' ') });
-        if (_consoleLog.length > 500) _consoleLog.shift();
-      };
-    });
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // COMBINE DEBUG RECORDER  Shift+F=start  Shift+M=export  Shift+D=contour
-    // ═══════════════════════════════════════════════════════════════════════
-    const _combineRec = { active: false, events: [], snapshots: [] };
-
     function _recNotify(text, color, duration) {
       color = color || '#ff3333'; duration = duration || 1200;
       const old = document.getElementById('_rec-notify');
@@ -9346,56 +9259,6 @@ window.Qube = new QubeSystem();
       el.appendChild(inner);
       document.body.appendChild(el);
       setTimeout(() => el.remove(), duration);
-    }
-
-    function _recStartCountdown() {
-      const seq = [{t:'3',c:'#ff3333',d:600},{t:'2',c:'#ff9900',d:600},{t:'1',c:'#ffff00',d:600},{t:'RECORD',c:'#00ffcc',d:1000}];
-      let delay = 0;
-      seq.forEach(({t,c,d}) => { setTimeout(() => _recNotify(t,c,d), delay); delay += d; });
-      setTimeout(() => {
-        _combineRec.active = true; _combineRec.events = []; _combineRec.snapshots = [];
-        _recSnapshot('session_start');
-      }, delay);
-    }
-
-    function _recSnapshot(label, extra) {
-      extra = extra || {};
-      if (!_combineRec.active && label !== 'session_start') return;
-      const snap = Object.assign({ label, timestamp: Date.now() }, extra, {
-        consoleTail: _consoleLog.slice(-30),
-        scene: {
-          scaledTileSize, zoom, panX, panY,
-          blocks: state.blocks.map(b => {
-            if (!b.body) return null;
-            const pos = b.body.GetPosition();
-            return { uid: b.uid, isTerrain: !!b.isTerrain, isCombine: !!b.multiVerts,
-              pos: {x: pos.get_x(), y: pos.get_y()}, angle: b.body.GetAngle(),
-              size: b.size, shapeId: b.shapeId, vertices: b.vertices,
-              multiVerts: b.multiVerts || null, surfaceVerts: b.surfaceVerts || null,
-              worldVerts: _blockWorldVerts(b) };
-          }).filter(Boolean)
-        }
-      });
-      _combineRec.snapshots.push(snap);
-      _combineRec.events.push({ type: label, ts: Date.now() });
-    }
-
-    function _recExport() {
-      _combineRec.active = false;
-      _recSnapshot('session_end');
-      const data = { meta: { recorded: new Date().toISOString(), snapshots: _combineRec.snapshots.length }, events: _combineRec.events, snapshots: _combineRec.snapshots };
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob); a.download = 'combine_debug_' + Date.now() + '.json'; a.click();
-      URL.revokeObjectURL(a.href);
-      _recNotify('EXPORTED', '#00ff88', 1500);
-    }
-
-    function _recOnCombinePlaced(blockX, blockY, pieces, surfaceVerts, newBlock) {
-      if (!_combineRec.active) return;
-      _recNotify('COMBINE ✓', '#ffcc00', 800);
-      _recSnapshot('combine_placed', { placement: {x:blockX,y:blockY}, piecesCount: pieces.length,
-        pieces, surfaceVerts, surfaceVertsCount: surfaceVerts ? surfaceVerts.length : 0, blockUid: newBlock && newBlock.uid });
     }
 
     // ── MANUAL CONTOUR TOOL ──
@@ -9446,7 +9309,6 @@ window.Qube = new QubeSystem();
     }
     function _contourCommit() {
       if (_manualContourPoints.length < 2) { _recNotify('NEED\nMORE POINTS', '#ff3333', 900); return; }
-      _recSnapshot('manual_contour', { points: _manualContourPoints.slice(), pointCount: _manualContourPoints.length });
       _recNotify('SAVED\n' + _manualContourPoints.length + ' PTS', '#00ff88', 1000);
       _manualContourMode = false; _manualContourPoints = []; _sceneDirty = true;
     }
@@ -10621,11 +10483,6 @@ window.Qube = new QubeSystem();
         } else if (e.button === 2) { _contourRemoveLast(); draw(); }
         return;
       }
-      // Overlap debug snap2: поймать момент клика при wall tool
-      if (_overlapDebug.active && currentTool === 'wall') {
-        _overlapDebug.snap2 = _takeOverlapSnapshot('at_click', worldPos.wx, worldPos.wy);
-        _downloadOverlapDebug();
-      }
       pointer.active = true;
       pointer.x = worldPos.wx;
       pointer.y = worldPos.wy;
@@ -11074,11 +10931,6 @@ window.Qube = new QubeSystem();
       // ─── END: COMBINE placement ─────────────────────────────────────────
 
       const newBlock = addBlock(blockX, blockY, blockOptions);
-      if (window._pendingRecHook) {
-        const h = window._pendingRecHook;
-        _recOnCombinePlaced(h.blockX, h.blockY, h.pieces, h.surfaceVerts, newBlock);
-        window._pendingRecHook = null;
-      }
       // ─── BEGIN: terrain kinematic + gravity assignment ──────────────────
       // Terrain всегда kinematic. Gravity по умолчанию включена для terrain;
       // кнопка GRAVITY = выключить для terrain / включить для обычного блока.
@@ -11628,20 +11480,10 @@ window.Qube = new QubeSystem();
         diagnoseWasmApi();
       }
 
-      // Overlap debug / contour
+      // Manual contour tool: Shift+D — вход / коммит контура
       if (e.key === 'D' && e.shiftKey) {
         e.preventDefault();
-        if (_combineRec.active) {
-          if (_manualContourMode) _contourCommit(); else _contourEnter();
-        } else { triggerOverlapDebug(); }
-      }
-      if (e.key === 'F' && e.shiftKey) {
-        e.preventDefault();
-        if (!_combineRec.active) _recStartCountdown(); else _recNotify('ALREADY\nRECORDING', '#ff9900', 1000);
-      }
-      if (e.key === 'M' && e.shiftKey) {
-        e.preventDefault();
-        if (_combineRec.active || _combineRec.snapshots.length > 0) _recExport(); else _recNotify('NOTHING\nTO EXPORT', '#ff3333', 1000);
+        if (_manualContourMode) _contourCommit(); else _contourEnter();
       }
 
       if (_manualContourMode) {
@@ -15021,110 +14863,6 @@ window.Qube = new QubeSystem();
       startup();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // BEGIN: TERRAIN COMBINE DEBUG
-    // Логирует параметры terrain блоков при размещении.
-    // Скачивает JSON через 8 секунд после загрузки движка.
-    // Убрать после диагностики.
-    // ═══════════════════════════════════════════════════════════════════════
-    (() => {
-      const _log = { events: [], snapshots: [] };
-
-      function _snapBlock(label, block) {
-        if (!block) return;
-        const pos = block.body?.GetPosition();
-        const entry = {
-          label,
-          t: Math.round(performance.now()),
-          uid: block.uid,
-          isTerrain: block.isTerrain,
-          hasShapeGravity: block.hasShapeGravity,
-          multiVerts: block.multiVerts ? block.multiVerts.length : null,
-          vertices: block.vertices ? block.vertices.length : null,
-          size: block.size,
-          savedMass: block.savedMass ?? null,
-          getMass: block.body ? block.body.GetMass() : null,
-          bodyType: block.body ? block.body.GetType() : null,
-          pos: pos ? { x: +pos.get_x().toFixed(3), y: +pos.get_y().toFixed(3) } : null,
-          inShapeGravityBodies: shapeGravityBodies.has(block),
-          shapeGravityBodiesSize: shapeGravityBodies.size,
-        };
-        _log.snapshots.push(entry);
-        console.log('[TERRAIN DEBUG]', label, entry);
-      }
-
-      // Перехватываем handleWallToolDown — патчим после addBlock
-      const _origHandleWall = handleWallToolDown;
-      let _terrainCount = 0;
-      window._terrainDebugSnap = _snapBlock;
-
-      // Патчим rebuildTerrainSurface чтобы логировать после каждого rebuild
-      const _origRebuild = rebuildTerrainSurface;
-      window.rebuildTerrainSurface = function() {
-        _origRebuild();
-        const terrainBlocks = state.blocks.filter(b => b.isTerrain);
-        _log.events.push({
-          t: Math.round(performance.now()),
-          event: 'rebuildTerrainSurface',
-          terrainCount: terrainBlocks.length,
-          surfaceSegs: state.terrainSurface?.length ?? 0,
-          shapeGravCount: shapeGravityBodies.size,
-          blocks: terrainBlocks.map(b => ({
-            uid: b.uid,
-            multiVerts: b.multiVerts?.length ?? null,
-            hasGrav: b.hasShapeGravity,
-            inSet: shapeGravityBodies.has(b),
-            getMass: b.body ? b.body.GetMass() : null,
-            savedMass: b.savedMass ?? null,
-          }))
-        });
-      };
-
-      // Патчим addBlock чтобы поймать момент создания terrain
-      const _origAddBlock = addBlock;
-      window._debugAddBlock = function(x, y, options) {
-        const block = _origAddBlock(x, y, options);
-        if (block && (options?.isTerrain || block.isTerrain)) {
-          _terrainCount++;
-          _snapBlock(
-            block.multiVerts ? `terrain_combined_#${_terrainCount}` : `terrain_single_#${_terrainCount}`,
-            block
-          );
-        }
-        return block;
-      };
-
-      // Скачать через 8 секунд
-      setTimeout(() => {
-        const out = {
-          meta: { recorded: new Date().toISOString(), engine: 'DreamLightEngine' },
-          snapshots: _log.snapshots,
-          events: _log.events,
-          finalState: {
-            terrainBlocks: state.blocks.filter(b => b.isTerrain).map(b => ({
-              uid: b.uid,
-              multiVerts: b.multiVerts?.length ?? null,
-              vertices: b.vertices?.length ?? null,
-              hasShapeGravity: b.hasShapeGravity,
-              inShapeGravityBodies: shapeGravityBodies.has(b),
-              getMass: b.body?.GetMass() ?? null,
-              savedMass: b.savedMass ?? null,
-              bodyType: b.body?.GetType() ?? null,
-            })),
-            shapeGravityBodiesSize: shapeGravityBodies.size,
-            terrainSurfaceSegs: state.terrainSurface?.length ?? 0,
-          }
-        };
-        const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = 'terrain_debug_' + Date.now() + '.json';
-        a.click();
-        URL.revokeObjectURL(a.href);
-        console.log('[TERRAIN DEBUG] Downloaded.');
-      }, 8000);
-    })();
-    // END: TERRAIN COMBINE DEBUG
 
     </script>
 
